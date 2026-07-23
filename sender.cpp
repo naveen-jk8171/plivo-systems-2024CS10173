@@ -17,6 +17,7 @@
  */
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <vector>
@@ -35,6 +36,12 @@ struct __attribute__((packed)) WirePacket {
 
 void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
+double get_time_s() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return tv.tv_sec + (tv.tv_usec / 1000000.0);
 }
 
 int main() {
@@ -62,13 +69,12 @@ int main() {
 
     std::vector<HarnessPacket> history(65536);
     std::vector<bool> sent(65536, false);
+    std::vector<double> last_resend(65536, 0.0);
 
     HarnessPacket pkt;
     uint32_t nack_seq;
-    
-    int redundant_bytes = 0;
-    // 240k Base Payload. Max budget is 480k. We cap redundancy safely at 225k.
-    const int MAX_REDUNDANT = 225000; 
+    int total_up_bytes = 0;
+    const int MAX_UP_BYTES = 475000; // Strictly under 480k (2.0x cap)
 
     while (true) {
         bool activity = false;
@@ -80,34 +86,37 @@ int main() {
                 history[seq] = pkt;
                 sent[seq] = true;
                 
-                // 83% FEC Coverage (Costs 160 bytes over the primary payload)
-                if (seq > 0 && (seq % 6 != 0) && redundant_bytes + 160 <= MAX_REDUNDANT) {
+                // 50% FEC Coverage (seq % 2 != 0)
+                if (seq > 0 && (seq % 2 != 0) && (total_up_bytes + sizeof(WirePacket) <= MAX_UP_BYTES)) {
                     WirePacket out_pkt;
                     out_pkt.seq = pkt.seq;
                     std::memcpy(out_pkt.payload, pkt.payload, 160);
                     std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160);
                     sendto(out_fd, &out_pkt, sizeof(out_pkt), 0, (sockaddr *)&relay, sizeof(relay));
-                    redundant_bytes += 160;
-                } else {
-                    // Primary payload ALWAYS sends. Never muted.
+                    total_up_bytes += sizeof(WirePacket);
+                } else if (total_up_bytes + sizeof(HarnessPacket) <= MAX_UP_BYTES) {
                     sendto(out_fd, &pkt, sizeof(pkt), 0, (sockaddr *)&relay, sizeof(relay));
+                    total_up_bytes += sizeof(HarnessPacket);
                 }
             }
         }
 
+        double now = get_time_s();
         while (recvfrom(nack_fd, &nack_seq, sizeof(nack_seq), 0, nullptr, nullptr) == sizeof(uint32_t)) {
             activity = true;
             uint32_t missing = ntohl(nack_seq);
             if (missing < 65536 && sent[missing]) {
-                // ARQ Resends cost the full 164 bytes
-                if (redundant_bytes + 164 <= MAX_REDUNDANT) {
-                    sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
-                    redundant_bytes += 164;
+                if (total_up_bytes + sizeof(HarnessPacket) <= MAX_UP_BYTES) {
+                    if (now - last_resend[missing] > 0.020) {
+                        sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
+                        total_up_bytes += sizeof(HarnessPacket);
+                        last_resend[missing] = now;
+                    }
                 }
             }
         }
         
-        if (!activity) usleep(100); 
+        if (!activity) usleep(150); 
     }
     return 0;
 }

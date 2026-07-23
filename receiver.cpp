@@ -69,20 +69,21 @@ int main() {
     std::vector<bool> received(65536, false);
     std::vector<double> last_nack_time(65536, 0.0);
     std::vector<double> gap_time(65536, 0.0);
-    std::vector<int> nack_count(65536, 0);
     
     int highest_seq = -1;
     int first_missing = 0;
     double t0 = 0.0;
+    double delay_s = 0.060;
     unsigned char buf[2048];
-    
     int total_nacks = 0;
-    const int MAX_NACKS = 1000; // Limits feedback to a strict 4000 bytes.
-    
+    const int MAX_NACKS = 250; // Strict limit to prevent down_bytes explosion
+
     while (true) {
         if (t0 == 0.0) {
             char* t0_env = getenv("T0");
             if (t0_env) t0 = atof(t0_env);
+            char* delay_env = getenv("DELAY_MS");
+            if (delay_env) delay_s = atof(delay_env) / 1000.0;
         }
 
         bool processed = false;
@@ -134,12 +135,11 @@ int main() {
             }
         }
 
-        while (first_missing < 65536 && received[first_missing]) {
+        while (first_missing <= highest_seq && received[first_missing]) {
             first_missing++;
         }
 
         int check_max = highest_seq;
-        
         if (t0 > 0.0) {
             int time_expected = (now - t0 - 0.015) / 0.020; 
             if (time_expected > check_max) check_max = time_expected;
@@ -147,30 +147,28 @@ int main() {
         if (check_max > 65535) check_max = 65535;
 
         for (int i = first_missing; i <= check_max; i++) {
-            if (!received[i] && nack_count[i] < 3 && total_nacks < MAX_NACKS) {
+            if (!received[i] && total_nacks < MAX_NACKS) {
+                double deadline = t0 + i * 0.020 + delay_s;
+                if (t0 > 0.0 && now > deadline - 0.005) continue;
+
                 bool should_nack = false;
-                
-                // Aggressive 5ms gap response
-                if (gap_time[i] > 0.0 && (now - gap_time[i] > 0.005)) {
+                // Give a 25ms patience window for reordering before triggering a NACK
+                if (gap_time[i] > 0.0 && (now - gap_time[i] > 0.025)) {
                     should_nack = true;
-                }
-                
-                // Aggressive 22ms time response
-                if (t0 > 0.0 && now > (t0 + i * 0.020 + 0.022)) {
+                } else if (t0 > 0.0 && now > (t0 + i * 0.020 + 0.025)) {
                     should_nack = true;
                 }
 
-                if (should_nack && (now - last_nack_time[i] > 0.012)) {
+                if (should_nack && (now - last_nack_time[i] > 0.025)) {
                     uint32_t n_seq = htonl(i);
                     sendto(fb_fd, &n_seq, sizeof(n_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
                     last_nack_time[i] = now;
-                    nack_count[i]++;
                     total_nacks++;
                 }
             }
         }
 
-        if (!processed) usleep(200); 
+        if (!processed) usleep(150); 
     }
     return 0;
 }
