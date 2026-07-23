@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -Wall -std=c++11
+CXXFLAGS ?= -O2 -Wall -std=c++17
 
 all: sender receiver
 
@@ -11,3 +11,4 @@ receiver: receiver.cpp
 
 clean:
 	rm -f sender receiver
+

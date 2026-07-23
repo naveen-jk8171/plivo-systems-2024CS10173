@@ -1,173 +1,252 @@
-/* BASELINE RECEIVER (C) — naive on purpose. Rewrite it (C, C++, Go, or Rust).
- *
- * Ports (all 127.0.0.1):
- *   bind 47002  <- media from your sender, via the hostile relay
- *   send 47020  -> harness player. MUST be: 4-byte big-endian seq +
- *                  160-byte payload. Frame i counts only if it arrives
- *                  BEFORE its deadline t0 + DELAY_MS + i*20ms.
- *   send 47003  -> feedback to your sender, via the relay (optional)
- *
- * This baseline forwards whatever arrives straight to the player: lost
- * frames stay lost, late frames stay late, duplicates are re-sent
- * harmlessly. All yours to fix — jitter buffer, reordering, recovery.
- *
- * Env vars available: T0, DURATION_S, DELAY_MS. Harness kills the process
- * at run end; a forever-loop is fine.
- */
+// receiver.cpp — Iterative FEC solver + NACK ARQ receiver
+// Compiles as C++17. Build: make
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <unistd.h>
+#include <sys/select.h>
 #include <sys/time.h>
-#include <fcntl.h>
-#include <vector>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <algorithm>
 
-struct __attribute__((packed)) HarnessPacket {
+// ── Constants ──────────────────────────────────────────────────────────
+constexpr uint8_t PKT_DATA              = 1;
+constexpr uint8_t PKT_PARITY            = 2;
+constexpr uint8_t PKT_NACK              = 3;
+constexpr uint8_t PKT_PARITY_INTERLEAVED = 4;
+
+constexpr int PAYLOAD_BYTES = 160;
+constexpr int HIST_SIZE     = 2048;
+constexpr int WIRE_PKT_SIZE = 1 + 4 + PAYLOAD_BYTES;
+
+// ── Wire formats ───────────────────────────────────────────────────────
+struct __attribute__((packed)) WireData {
+    uint8_t  type;
     uint32_t seq;
-    unsigned char payload[160];
+    uint8_t  payload[PAYLOAD_BYTES];
+};
+static_assert(sizeof(WireData) == WIRE_PKT_SIZE, "WireData must be 165 bytes");
+
+struct __attribute__((packed)) WireNack {
+    uint8_t  type;
+    uint8_t  count;
+    uint32_t seqs[30];
 };
 
-struct __attribute__((packed)) WirePacket {
-    uint32_t seq;
-    unsigned char payload[160];
-    unsigned char prev_payload[160];
-};
+// ── State ──────────────────────────────────────────────────────────────
+static bool    has_data[HIST_SIZE];
+static uint8_t data_store[HIST_SIZE][PAYLOAD_BYTES];
 
-double get_time_s() {
+static bool    has_parity_c[HIST_SIZE];   // consecutive parity
+static uint8_t parity_c_store[HIST_SIZE][PAYLOAD_BYTES];
+
+static bool    has_parity_i[HIST_SIZE];   // interleaved parity
+static uint8_t parity_i_store[HIST_SIZE][PAYLOAD_BYTES];
+
+static int    max_seq_seen = -1;
+static double last_nack_time = 0.0;
+
+// Player socket (global for helper functions)
+static int         player_fd;
+static sockaddr_in player_addr;
+
+// ── Helpers ────────────────────────────────────────────────────────────
+static double now_sec() {
     struct timeval tv;
     gettimeofday(&tv, nullptr);
-    return tv.tv_sec + (tv.tv_usec / 1000000.0);
+    return tv.tv_sec + tv.tv_usec / 1'000'000.0;
 }
 
-void set_nonblocking(int fd) {
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+static void emit_to_player(uint32_t seq, const uint8_t* payload) {
+    uint8_t buf[164];
+    uint32_t net_seq = htonl(seq);
+    std::memcpy(buf, &net_seq, 4);
+    std::memcpy(buf + 4, payload, PAYLOAD_BYTES);
+    sendto(player_fd, buf, 164, 0,
+           reinterpret_cast<sockaddr*>(&player_addr), sizeof(player_addr));
 }
 
+// ── FEC solver ─────────────────────────────────────────────────────────
+// Try to solve a single parity equation. If exactly one member is missing,
+// recover it by XOR-ing all known members against the parity payload.
+static void try_solve(const bool* has_par, const uint8_t (*par_store)[PAYLOAD_BYTES],
+                      uint32_t eq_seq, const uint32_t* members, int n,
+                      bool& changed) {
+    if (!has_par[eq_seq % HIST_SIZE]) return;
+
+    int      missing_n   = 0;
+    uint32_t missing_seq = 0;
+
+    for (int j = 0; j < n; ++j) {
+        if (!has_data[members[j] % HIST_SIZE]) {
+            ++missing_n;
+            missing_seq = members[j];
+        }
+    }
+    if (missing_n != 1) return;
+
+    // Recover the single missing frame
+    uint8_t recovered[PAYLOAD_BYTES];
+    std::memcpy(recovered, par_store[eq_seq % HIST_SIZE], PAYLOAD_BYTES);
+    for (int j = 0; j < n; ++j) {
+        if (members[j] != missing_seq) {
+            for (int b = 0; b < PAYLOAD_BYTES; ++b)
+                recovered[b] ^= data_store[members[j] % HIST_SIZE][b];
+        }
+    }
+
+    std::memcpy(data_store[missing_seq % HIST_SIZE], recovered, PAYLOAD_BYTES);
+    has_data[missing_seq % HIST_SIZE] = true;
+    emit_to_player(missing_seq, recovered);
+    changed = true;
+}
+
+// Run iterative solver until no more equations can be resolved.
+static void run_solver() {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+
+        uint32_t lo = (max_seq_seen > 200) ? max_seq_seen - 200 : 0;
+        uint32_t hi = max_seq_seen + 10;
+
+        for (uint32_t i = lo; i <= hi; ++i) {
+            // Consecutive parity: covers {i, i-1, i-2, i-3}
+            {
+                uint32_t m[4]; int n = 0;
+                for (int j = 0; j <= 3; ++j)
+                    if (i >= static_cast<uint32_t>(j)) m[n++] = i - j;
+                if (n > 0) try_solve(has_parity_c, parity_c_store, i, m, n, changed);
+            }
+            // Interleaved parity: covers {i, i-2, i-4, i-6}
+            {
+                uint32_t m[4]; int n = 0;
+                for (int j = 0; j <= 3; ++j) {
+                    uint32_t off = j * 2;
+                    if (i >= off) m[n++] = i - off;
+                }
+                if (n > 0) try_solve(has_parity_i, parity_i_store, i, m, n, changed);
+            }
+        }
+    }
+}
+
+// ── Slot management ────────────────────────────────────────────────────
+static void advance_watermark(uint32_t seq) {
+    if (static_cast<int>(seq) <= max_seq_seen) return;
+    max_seq_seen = seq;
+    // Evict stale slots that will be reused
+    for (int i = 1; i <= 50; ++i) {
+        uint32_t old = seq + HIST_SIZE / 2 + i;
+        has_data[old % HIST_SIZE]     = false;
+        has_parity_c[old % HIST_SIZE] = false;
+        has_parity_i[old % HIST_SIZE] = false;
+    }
+}
+
+// ── Main ───────────────────────────────────────────────────────────────
 int main() {
+    // Socket: relay → receiver (port 47002)
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in in_addr{};
-    in_addr.sin_family = AF_INET;
-    in_addr.sin_port = htons(47002);
-    in_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    bind(in_fd, (sockaddr *)&in_addr, sizeof(in_addr));
-    set_nonblocking(in_fd);
-
-    int player_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in player{};
-    player.sin_family = AF_INET;
-    player.sin_port = htons(47020);
-    player.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    int fb_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in feedback{};
-    feedback.sin_family = AF_INET;
-    feedback.sin_port = htons(47003);
-    feedback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    std::vector<bool> received(65536, false);
-    std::vector<double> last_nack_time(65536, 0.0);
-    std::vector<double> gap_time(65536, 0.0);
-    
-    int highest_seq = -1;
-    int first_missing = 0;
-    double t0 = 0.0;
-    double delay_s = 0.060;
-    unsigned char buf[2048];
-    int total_nacks = 0;
-    const int MAX_NACKS = 400; // Raised to handle remaining drops
-
-    while (true) {
-        if (t0 == 0.0) {
-            char* t0_env = getenv("T0");
-            if (t0_env) t0 = atof(t0_env);
-            char* delay_env = getenv("DELAY_MS");
-            if (delay_env) delay_s = atof(delay_env) / 1000.0;
-        }
-
-        bool processed = false;
-        ssize_t n;
-        double now = get_time_s();
-        
-        while ((n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr)) > 0) {
-            processed = true;
-            uint32_t seq = 0;
-            
-            if (n == sizeof(WirePacket)) {
-                WirePacket* wpkt = reinterpret_cast<WirePacket*>(buf);
-                seq = ntohl(wpkt->seq);
-                
-                if (seq < 65536) {
-                    if (!received[seq]) {
-                        received[seq] = true;
-                        HarnessPacket p;
-                        p.seq = wpkt->seq;
-                        std::memcpy(p.payload, wpkt->payload, 160);
-                        sendto(player_fd, &p, sizeof(p), 0, (sockaddr *)&player, sizeof(player));
-                    }
-                    if (seq > 0 && !received[seq - 1]) {
-                        received[seq - 1] = true;
-                        HarnessPacket p;
-                        p.seq = htonl(seq - 1);
-                        std::memcpy(p.payload, wpkt->prev_payload, 160);
-                        sendto(player_fd, &p, sizeof(p), 0, (sockaddr *)&player, sizeof(player));
-                    }
-                }
-            } 
-            else if (n == sizeof(HarnessPacket)) {
-                HarnessPacket* hpkt = reinterpret_cast<HarnessPacket*>(buf);
-                seq = ntohl(hpkt->seq);
-                
-                if (seq < 65536) {
-                    if (!received[seq]) {
-                        received[seq] = true;
-                        sendto(player_fd, hpkt, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
-                    }
-                }
-            }
-
-            if (seq < 65536 && (int)seq > highest_seq) {
-                for (int i = highest_seq + 1; i < (int)seq; i++) {
-                    if (gap_time[i] == 0.0) gap_time[i] = now;
-                }
-                highest_seq = seq;
-            }
-        }
-
-        while (first_missing <= highest_seq && received[first_missing]) {
-            first_missing++;
-        }
-
-        int check_max = highest_seq;
-        if (t0 > 0.0) {
-            int time_expected = (now - t0 - 0.015) / 0.020; 
-            if (time_expected > check_max) check_max = time_expected;
-        }
-        if (check_max > 65535) check_max = 65535;
-
-        for (int i = first_missing; i <= check_max; i++) {
-            if (!received[i] && total_nacks < MAX_NACKS) {
-                double deadline = t0 + i * 0.020 + delay_s;
-                if (t0 > 0.0 && now > deadline - 0.005) continue;
-
-                bool should_nack = false;
-                if (gap_time[i] > 0.0 && (now - gap_time[i] > 0.020)) {
-                    should_nack = true;
-                } else if (t0 > 0.0 && now > (t0 + i * 0.020 + 0.022)) {
-                    should_nack = true;
-                }
-
-                if (should_nack && (now - last_nack_time[i] > 0.020)) {
-                    uint32_t n_seq = htonl(i);
-                    sendto(fb_fd, &n_seq, sizeof(n_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
-                    last_nack_time[i] = now;
-                    total_nacks++;
-                }
-            }
-        }
-
-        if (!processed) usleep(150); 
+    in_addr.sin_family      = AF_INET;
+    in_addr.sin_port        = htons(47002);
+    in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(in_fd, reinterpret_cast<sockaddr*>(&in_addr), sizeof(in_addr)) < 0) {
+        perror("bind 47002"); return 1;
     }
-    return 0;
+
+    // Socket: receiver → harness player (port 47020)
+    player_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    std::memset(&player_addr, 0, sizeof(player_addr));
+    player_addr.sin_family      = AF_INET;
+    player_addr.sin_port        = htons(47020);
+    player_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    // Socket: receiver → relay feedback (port 47003)
+    int fb_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in fb_addr{};
+    fb_addr.sin_family      = AF_INET;
+    fb_addr.sin_port        = htons(47003);
+    fb_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    // Init state
+    std::memset(has_data,     0, sizeof(has_data));
+    std::memset(has_parity_c, 0, sizeof(has_parity_c));
+    std::memset(has_parity_i, 0, sizeof(has_parity_i));
+    last_nack_time = now_sec();
+
+    uint8_t buf[2048];
+
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(in_fd, &rfds);
+        timeval tv{0, 5000};  // 5 ms
+
+        int ready = select(in_fd + 1, &rfds, nullptr, nullptr, &tv);
+
+        // ── Process incoming packet ────────────────────────────────────
+        if (ready > 0 && FD_ISSET(in_fd, &rfds)) {
+            ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr);
+            if (n >= WIRE_PKT_SIZE) {
+                auto* pkt = reinterpret_cast<WireData*>(buf);
+                uint32_t seq = ntohl(pkt->seq);
+                advance_watermark(seq);
+
+                switch (pkt->type) {
+                case PKT_DATA:
+                    if (!has_data[seq % HIST_SIZE]) {
+                        has_data[seq % HIST_SIZE] = true;
+                        std::memcpy(data_store[seq % HIST_SIZE], pkt->payload, PAYLOAD_BYTES);
+                        emit_to_player(seq, pkt->payload);
+                        run_solver();
+                    }
+                    break;
+
+                case PKT_PARITY:
+                    if (!has_parity_c[seq % HIST_SIZE]) {
+                        has_parity_c[seq % HIST_SIZE] = true;
+                        std::memcpy(parity_c_store[seq % HIST_SIZE], pkt->payload, PAYLOAD_BYTES);
+                        run_solver();
+                    }
+                    break;
+
+                case PKT_PARITY_INTERLEAVED:
+                    if (!has_parity_i[seq % HIST_SIZE]) {
+                        has_parity_i[seq % HIST_SIZE] = true;
+                        std::memcpy(parity_i_store[seq % HIST_SIZE], pkt->payload, PAYLOAD_BYTES);
+                        run_solver();
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ── Periodic NACK generation ───────────────────────────────────
+        double now = now_sec();
+        if (now - last_nack_time >= 0.005) {
+            last_nack_time = now;
+
+            WireNack nack{};
+            nack.type  = PKT_NACK;
+            nack.count = 0;
+
+            int start = (max_seq_seen > 100) ? max_seq_seen - 100 : 0;
+            for (int i = start; i < max_seq_seen; ++i) {
+                if (!has_data[i % HIST_SIZE]) {
+                    nack.seqs[nack.count++] = htonl(i);
+                    if (nack.count == 30) break;
+                }
+            }
+
+            if (nack.count > 0) {
+                sendto(fb_fd, &nack, 2 + 4 * nack.count, 0,
+                       reinterpret_cast<sockaddr*>(&fb_addr), sizeof(fb_addr));
+            }
+        }
+    }
 }
