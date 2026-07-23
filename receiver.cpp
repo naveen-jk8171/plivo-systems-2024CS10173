@@ -17,8 +17,12 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <iostream>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <vector>
+#include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 struct __attribute__((packed)) HarnessPacket {
     uint32_t seq;
@@ -31,41 +35,116 @@ struct __attribute__((packed)) WirePacket {
     unsigned char prev_payload[160];
 };
 
+double get_time_s() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return tv.tv_sec + (tv.tv_usec / 1000000.0);
+}
+
+void set_nonblocking(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
 int main() {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in in_addr{};
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47002);
-    in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    in_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bind(in_fd, (sockaddr *)&in_addr, sizeof(in_addr));
+    set_nonblocking(in_fd);
 
-    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int player_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in player{};
     player.sin_family = AF_INET;
     player.sin_port = htons(47020);
-    player.sin_addr.s_addr = inet_addr("127.0.0.1");
+    player.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
+    int fb_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in feedback{};
+    feedback.sin_family = AF_INET;
+    feedback.sin_port = htons(47003);
+    feedback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    std::vector<bool> received(65536, false);
+    std::vector<double> last_nack_time(65536, 0.0);
+    std::vector<int> nack_count(65536, 0);
+    
+    int highest_seq = -1;
+    int first_missing = 0;
+    double t0 = 0.0;
     unsigned char buf[2048];
-
+    
     while (true) {
-        ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr);
-        if (n <= 0) continue;
+        if (t0 == 0.0) {
+            char* t0_env = getenv("T0");
+            if (t0_env) t0 = atof(t0_env);
+        }
 
-        WirePacket* pkt = reinterpret_cast<WirePacket*>(buf);
-        uint32_t seq = ntohl(pkt->seq);
+        bool processed = false;
+        ssize_t n;
+        
+        while ((n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr)) > 0) {
+            processed = true;
+            if (n == sizeof(WirePacket)) {
+                WirePacket* wpkt = reinterpret_cast<WirePacket*>(buf);
+                uint32_t seq = ntohl(wpkt->seq);
+                
+                if (seq < 65536) {
+                    if ((int)seq > highest_seq) highest_seq = seq;
+                    
+                    if (!received[seq]) {
+                        received[seq] = true;
+                        HarnessPacket p;
+                        p.seq = wpkt->seq;
+                        std::memcpy(p.payload, wpkt->payload, 160);
+                        sendto(player_fd, &p, sizeof(p), 0, (sockaddr *)&player, sizeof(player));
+                    }
+                    if (seq > 0 && !received[seq - 1]) {
+                        received[seq - 1] = true;
+                        HarnessPacket p;
+                        p.seq = htonl(seq - 1);
+                        std::memcpy(p.payload, wpkt->prev_payload, 160);
+                        sendto(player_fd, &p, sizeof(p), 0, (sockaddr *)&player, sizeof(player));
+                    }
+                }
+            } 
+            else if (n == sizeof(HarnessPacket)) {
+                HarnessPacket* hpkt = reinterpret_cast<HarnessPacket*>(buf);
+                uint32_t seq = ntohl(hpkt->seq);
+                
+                if (seq < 65536) {
+                    if ((int)seq > highest_seq) highest_seq = seq;
+                    
+                    if (!received[seq]) {
+                        received[seq] = true;
+                        sendto(player_fd, hpkt, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
+                    }
+                }
+            }
+        }
+        while (first_missing < 65536 && received[first_missing]) {
+            first_missing++;
+        }
+        double now = get_time_s();
+        if (t0 > 0.0) {
+            int time_expected = (now - t0 - 0.010) / 0.020; 
+            int check_max = std::max(highest_seq, time_expected);
+            if (check_max > 65535) check_max = 65535;
+            for (int i = first_missing; i <= check_max; i++) {
+                if (!received[i] && nack_count[i] < 4) {
+                    if (now - last_nack_time[i] > 0.015) { 
+                        uint32_t nack_seq = htonl(i);
+                        sendto(fb_fd, &nack_seq, sizeof(nack_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
+                        last_nack_time[i] = now;
+                        nack_count[i]++;
+                    }
+                }
+            }
+        }
 
-        // 1. Send the primary frame immediately to the player
-        HarnessPacket out1;
-        out1.seq = pkt->seq; 
-        std::memcpy(out1.payload, pkt->payload, 160);
-        sendto(out_fd, &out1, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
-
-        // 2. If the packet contains the redundant payload, send the previous frame immediately
-        if (n == sizeof(WirePacket) && seq > 0) {
-            HarnessPacket out2;
-            out2.seq = htonl(seq - 1);
-            std::memcpy(out2.payload, pkt->prev_payload, 160);
-            sendto(out_fd, &out2, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
+        if (!processed) {
+            usleep(500); 
         }
     }
     return 0;

@@ -18,7 +18,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <iostream>
+#include <fcntl.h>
+#include <vector>
 #include <cstring>
 
 struct __attribute__((packed)) HarnessPacket {
@@ -32,42 +33,63 @@ struct __attribute__((packed)) WirePacket {
     unsigned char prev_payload[160];
 };
 
+void set_nonblocking(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
 int main() {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in in_addr{};
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47010);
-    in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    in_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bind(in_fd, (sockaddr *)&in_addr, sizeof(in_addr));
+    set_nonblocking(in_fd);
+
+    int nack_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in nack_addr{};
+    nack_addr.sin_family = AF_INET;
+    nack_addr.sin_port = htons(47004);
+    nack_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(nack_fd, (sockaddr *)&nack_addr, sizeof(nack_addr));
+    set_nonblocking(nack_fd);
 
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in relay{};
     relay.sin_family = AF_INET;
     relay.sin_port = htons(47001);
-    relay.sin_addr.s_addr = inet_addr("127.0.0.1");
+    relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    HarnessPacket in_pkt;
-    unsigned char prev_payload[160] = {0};
+    std::vector<HarnessPacket> history(65536);
+    std::vector<bool> sent(65536, false);
+
+    HarnessPacket pkt;
+    uint32_t nack_seq;
 
     while (true) {
-        ssize_t n = recvfrom(in_fd, &in_pkt, sizeof(in_pkt), 0, nullptr, nullptr);
-        if (n != sizeof(HarnessPacket)) continue;
-
-        uint32_t seq = ntohl(in_pkt.seq);
-
-        WirePacket out_pkt;
-        out_pkt.seq = in_pkt.seq; 
-        std::memcpy(out_pkt.payload, in_pkt.payload, 160);
-        
-        // Skip redundancy on every 38th packet to hit ~1.999x bandwidth overhead
-        if (seq > 0 && (seq % 38 != 0)) {
-            std::memcpy(out_pkt.prev_payload, prev_payload, 160);
-            sendto(out_fd, &out_pkt, sizeof(WirePacket), 0, (sockaddr *)&relay, sizeof(relay));
-        } else {
-            sendto(out_fd, &out_pkt, sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
+        while (recvfrom(in_fd, &pkt, sizeof(pkt), 0, nullptr, nullptr) == sizeof(HarnessPacket)) {
+            uint32_t seq = ntohl(pkt.seq);
+            if (seq < 65536) {
+                history[seq] = pkt;
+                sent[seq] = true;
+                if (seq > 0 && (seq % 8 != 0)) {
+                    WirePacket out_pkt;
+                    out_pkt.seq = pkt.seq;
+                    std::memcpy(out_pkt.payload, pkt.payload, 160);
+                    std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160);
+                    sendto(out_fd, &out_pkt, sizeof(out_pkt), 0, (sockaddr *)&relay, sizeof(relay));
+                } else {
+                    sendto(out_fd, &pkt, sizeof(pkt), 0, (sockaddr *)&relay, sizeof(relay));
+                }
+            }
         }
-
-        std::memcpy(prev_payload, in_pkt.payload, 160);
+        while (recvfrom(nack_fd, &nack_seq, sizeof(nack_seq), 0, nullptr, nullptr) == sizeof(uint32_t)) {
+            uint32_t missing = ntohl(nack_seq);
+            if (missing < 65536 && sent[missing]) {
+                sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
+            }
+        }
+        usleep(500); 
     }
     return 0;
 }
