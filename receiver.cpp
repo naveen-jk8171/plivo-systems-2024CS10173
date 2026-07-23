@@ -76,7 +76,7 @@ int main() {
     double delay_s = 0.060;
     unsigned char buf[2048];
     int total_nacks = 0;
-    const int MAX_NACKS = 250; // Strict limit to prevent down_bytes explosion
+    const int MAX_NACKS = 400; // Raised to handle remaining drops
 
     while (true) {
         if (t0 == 0.0) {
@@ -152,14 +152,13 @@ int main() {
                 if (t0 > 0.0 && now > deadline - 0.005) continue;
 
                 bool should_nack = false;
-                // Give a 25ms patience window for reordering before triggering a NACK
-                if (gap_time[i] > 0.0 && (now - gap_time[i] > 0.025)) {
+                if (gap_time[i] > 0.0 && (now - gap_time[i] > 0.020)) {
                     should_nack = true;
-                } else if (t0 > 0.0 && now > (t0 + i * 0.020 + 0.025)) {
+                } else if (t0 > 0.0 && now > (t0 + i * 0.020 + 0.022)) {
                     should_nack = true;
                 }
 
-                if (should_nack && (now - last_nack_time[i] > 0.025)) {
+                if (should_nack && (now - last_nack_time[i] > 0.020)) {
                     uint32_t n_seq = htonl(i);
                     sendto(fb_fd, &n_seq, sizeof(n_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
                     last_nack_time[i] = now;

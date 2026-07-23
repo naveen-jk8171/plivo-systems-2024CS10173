@@ -74,11 +74,12 @@ int main() {
     HarnessPacket pkt;
     uint32_t nack_seq;
     int total_up_bytes = 0;
-    const int MAX_UP_BYTES = 475000; // Strictly under 480k (2.0x cap)
+    const int MAX_UP_BYTES = 475000; // Safe ceiling under the 480k (2.0x) hard limit
 
     while (true) {
         bool activity = false;
         
+        // 1. PRIMARY MEDIA LOOP: Primary packets are NEVER dropped.
         while (recvfrom(in_fd, &pkt, sizeof(pkt), 0, nullptr, nullptr) == sizeof(HarnessPacket)) {
             activity = true;
             uint32_t seq = ntohl(pkt.seq);
@@ -86,21 +87,27 @@ int main() {
                 history[seq] = pkt;
                 sent[seq] = true;
                 
-                // 50% FEC Coverage (seq % 2 != 0)
-                if (seq > 0 && (seq % 2 != 0) && (total_up_bytes + sizeof(WirePacket) <= MAX_UP_BYTES)) {
+                bool sent_fec = false;
+                // 66% FEC Coverage (seq % 3 != 0) if budget allows
+                if (seq > 0 && (seq % 3 != 0) && (total_up_bytes + sizeof(WirePacket) <= MAX_UP_BYTES)) {
                     WirePacket out_pkt;
                     out_pkt.seq = pkt.seq;
                     std::memcpy(out_pkt.payload, pkt.payload, 160);
                     std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160);
                     sendto(out_fd, &out_pkt, sizeof(out_pkt), 0, (sockaddr *)&relay, sizeof(relay));
                     total_up_bytes += sizeof(WirePacket);
-                } else if (total_up_bytes + sizeof(HarnessPacket) <= MAX_UP_BYTES) {
+                    sent_fec = true;
+                }
+                
+                // Fallback: Always ensure the base harness packet goes out
+                if (!sent_fec) {
                     sendto(out_fd, &pkt, sizeof(pkt), 0, (sockaddr *)&relay, sizeof(relay));
                     total_up_bytes += sizeof(HarnessPacket);
                 }
             }
         }
 
+        // 2. ARQ RESENDS
         double now = get_time_s();
         while (recvfrom(nack_fd, &nack_seq, sizeof(nack_seq), 0, nullptr, nullptr) == sizeof(uint32_t)) {
             activity = true;
