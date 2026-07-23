@@ -72,24 +72,27 @@ int main() {
             if (seq < 65536) {
                 history[seq] = pkt;
                 sent[seq] = true;
+                
+                // 87.5% FEC Coverage: guarantees bandwidth stays below 2.00x cap
                 if (seq > 0 && (seq % 8 != 0)) {
                     WirePacket out_pkt;
                     out_pkt.seq = pkt.seq;
                     std::memcpy(out_pkt.payload, pkt.payload, 160);
-                    std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160);
+                    std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160); // Offset 1
                     sendto(out_fd, &out_pkt, sizeof(out_pkt), 0, (sockaddr *)&relay, sizeof(relay));
                 } else {
                     sendto(out_fd, &pkt, sizeof(pkt), 0, (sockaddr *)&relay, sizeof(relay));
                 }
             }
         }
+
         while (recvfrom(nack_fd, &nack_seq, sizeof(nack_seq), 0, nullptr, nullptr) == sizeof(uint32_t)) {
             uint32_t missing = ntohl(nack_seq);
             if (missing < 65536 && sent[missing]) {
                 sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
             }
         }
-        usleep(500); 
+        usleep(200); 
     }
     return 0;
 }

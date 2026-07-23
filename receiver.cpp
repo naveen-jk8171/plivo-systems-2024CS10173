@@ -86,13 +86,14 @@ int main() {
         
         while ((n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr)) > 0) {
             processed = true;
+            uint32_t seq = 0;
+            
+            // 1. EXTRACT FROM FEC WIRE PACKET
             if (n == sizeof(WirePacket)) {
                 WirePacket* wpkt = reinterpret_cast<WirePacket*>(buf);
-                uint32_t seq = ntohl(wpkt->seq);
+                seq = ntohl(wpkt->seq);
                 
                 if (seq < 65536) {
-                    if ((int)seq > highest_seq) highest_seq = seq;
-                    
                     if (!received[seq]) {
                         received[seq] = true;
                         HarnessPacket p;
@@ -109,31 +110,49 @@ int main() {
                     }
                 }
             } 
+            // 2. EXTRACT FROM ARQ RESEND PACKET
             else if (n == sizeof(HarnessPacket)) {
                 HarnessPacket* hpkt = reinterpret_cast<HarnessPacket*>(buf);
-                uint32_t seq = ntohl(hpkt->seq);
+                seq = ntohl(hpkt->seq);
                 
                 if (seq < 65536) {
-                    if ((int)seq > highest_seq) highest_seq = seq;
-                    
                     if (!received[seq]) {
                         received[seq] = true;
                         sendto(player_fd, hpkt, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
                     }
                 }
             }
+
+            if (seq < 65536 && (int)seq > highest_seq) {
+                highest_seq = seq;
+            }
         }
+
         while (first_missing < 65536 && received[first_missing]) {
             first_missing++;
         }
+
         double now = get_time_s();
+        
+        // 3. INSTANT ARQ LOGIC: If a sequence is still missing behind our highest marker, FEC failed.
+        for (int i = first_missing; i < highest_seq; i++) {
+            if (!received[i] && nack_count[i] == 0) {
+                uint32_t nack_seq = htonl(i);
+                sendto(fb_fd, &nack_seq, sizeof(nack_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
+                last_nack_time[i] = now;
+                nack_count[i]++;
+            }
+        }
+
+        // 4. TIME-BASED FALLBACK: For packets at the absolute end of the stream without trailing packets to trigger gaps
         if (t0 > 0.0) {
-            int time_expected = (now - t0 - 0.010) / 0.020; 
+            int time_expected = (now - t0 - 0.035) / 0.020; 
             int check_max = std::max(highest_seq, time_expected);
             if (check_max > 65535) check_max = 65535;
+
             for (int i = first_missing; i <= check_max; i++) {
-                if (!received[i] && nack_count[i] < 4) {
-                    if (now - last_nack_time[i] > 0.015) { 
+                if (!received[i] && nack_count[i] < 2) {
+                    if (now - last_nack_time[i] > 0.025) { 
                         uint32_t nack_seq = htonl(i);
                         sendto(fb_fd, &nack_seq, sizeof(nack_seq), 0, (sockaddr *)&feedback, sizeof(feedback));
                         last_nack_time[i] = now;
@@ -143,9 +162,7 @@ int main() {
             }
         }
 
-        if (!processed) {
-            usleep(500); 
-        }
+        if (!processed) usleep(200); 
     }
     return 0;
 }
