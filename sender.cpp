@@ -65,34 +65,49 @@ int main() {
 
     HarnessPacket pkt;
     uint32_t nack_seq;
+    
+    int redundant_bytes = 0;
+    // 240k Base Payload. Max budget is 480k. We cap redundancy safely at 225k.
+    const int MAX_REDUNDANT = 225000; 
 
     while (true) {
+        bool activity = false;
+        
         while (recvfrom(in_fd, &pkt, sizeof(pkt), 0, nullptr, nullptr) == sizeof(HarnessPacket)) {
+            activity = true;
             uint32_t seq = ntohl(pkt.seq);
             if (seq < 65536) {
                 history[seq] = pkt;
                 sent[seq] = true;
                 
-                // 87.5% FEC Coverage: guarantees bandwidth stays below 2.00x cap
-                if (seq > 0 && (seq % 8 != 0)) {
+                // 83% FEC Coverage (Costs 160 bytes over the primary payload)
+                if (seq > 0 && (seq % 6 != 0) && redundant_bytes + 160 <= MAX_REDUNDANT) {
                     WirePacket out_pkt;
                     out_pkt.seq = pkt.seq;
                     std::memcpy(out_pkt.payload, pkt.payload, 160);
-                    std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160); // Offset 1
+                    std::memcpy(out_pkt.prev_payload, history[seq-1].payload, 160);
                     sendto(out_fd, &out_pkt, sizeof(out_pkt), 0, (sockaddr *)&relay, sizeof(relay));
+                    redundant_bytes += 160;
                 } else {
+                    // Primary payload ALWAYS sends. Never muted.
                     sendto(out_fd, &pkt, sizeof(pkt), 0, (sockaddr *)&relay, sizeof(relay));
                 }
             }
         }
 
         while (recvfrom(nack_fd, &nack_seq, sizeof(nack_seq), 0, nullptr, nullptr) == sizeof(uint32_t)) {
+            activity = true;
             uint32_t missing = ntohl(nack_seq);
             if (missing < 65536 && sent[missing]) {
-                sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
+                // ARQ Resends cost the full 164 bytes
+                if (redundant_bytes + 164 <= MAX_REDUNDANT) {
+                    sendto(out_fd, &history[missing], sizeof(HarnessPacket), 0, (sockaddr *)&relay, sizeof(relay));
+                    redundant_bytes += 164;
+                }
             }
         }
-        usleep(200); 
+        
+        if (!activity) usleep(100); 
     }
     return 0;
 }
