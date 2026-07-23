@@ -15,35 +15,58 @@
  * at run end; a forever-loop is fine.
  */
 #include <arpa/inet.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <iostream>
+#include <cstring>
 
-int main(void) {
+struct __attribute__((packed)) HarnessPacket {
+    uint32_t seq;
+    unsigned char payload[160];
+};
+
+struct __attribute__((packed)) WirePacket {
+    uint32_t seq;
+    unsigned char payload[160];
+    unsigned char prev_payload[160];
+};
+
+int main() {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in in_addr = {0};
+    sockaddr_in in_addr{};
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47002);
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof in_addr) < 0) {
-        perror("bind 47002");
-        return 1;
-    }
+    bind(in_fd, (sockaddr *)&in_addr, sizeof(in_addr));
 
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in player = {0};
+    sockaddr_in player{};
     player.sin_family = AF_INET;
     player.sin_port = htons(47020);
     player.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     unsigned char buf[2048];
-    for (;;) {
-        ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
+
+    while (true) {
+        ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, nullptr, nullptr);
         if (n <= 0) continue;
-        /* jitter buffer / reorder / recovery logic goes here */
-        sendto(out_fd, buf, (size_t)n, 0, (struct sockaddr *)&player,
-               sizeof player);
+
+        WirePacket* pkt = reinterpret_cast<WirePacket*>(buf);
+        uint32_t seq = ntohl(pkt->seq);
+
+        // 1. Send the primary frame immediately to the player
+        HarnessPacket out1;
+        out1.seq = pkt->seq; 
+        std::memcpy(out1.payload, pkt->payload, 160);
+        sendto(out_fd, &out1, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
+
+        // 2. If the packet contains the redundant payload, send the previous frame immediately
+        if (n == sizeof(WirePacket) && seq > 0) {
+            HarnessPacket out2;
+            out2.seq = htonl(seq - 1);
+            std::memcpy(out2.payload, pkt->prev_payload, 160);
+            sendto(out_fd, &out2, sizeof(HarnessPacket), 0, (sockaddr *)&player, sizeof(player));
+        }
     }
     return 0;
 }
